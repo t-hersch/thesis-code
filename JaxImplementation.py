@@ -1,11 +1,12 @@
 import jax
-import free_lie_algebra as fla
+import liealgebra as fla
 import jax.numpy as jnp
 import numpy as np
 import diffrax
 import functools as ft
 import datetime as dt
 from typing import Optional
+import inspect as isp
 
 from cubature_construction import wiener_cubature, dim_2_wiener_cubature
 
@@ -34,7 +35,17 @@ def get_partition(interval: tuple[float, float],
 
 
 def get_vf_derivatives(func: callable,
+                       # args: jax.typing.ArrayLike | tuple[jax.typing.ArrayLike, jax.typing.ArrayLike],
                        truncation_level: int) -> list[callable]:
+
+    # jaxpr = jax.make_jaxpr(func)(*args)
+    #
+    # if len(jaxpr.in_avals) > 1:
+    #     final_func = ft.partial(func, t=args[0])
+    #
+    # else:
+    #     final_func = func
+
     aux = func
     result = [aux]
 
@@ -105,8 +116,8 @@ def _tuple_to_jax(tpl: tuple[jax.typing.ArrayLike, ...],
     :param dim: dimension of space over which the tensor algebra is defined
     :param truncation_level: truncation level
     :return: Jax array of shape (truncation_level, dim, dim, ... dim), where dim is repeated truncation_level times.
-    the last level of the element will be indexed by [truncation_level, ...], the second to last will be
-    indexed by [truncation_level - 1, 0, ...], and so on.
+    the last level of the element will be indexed by [truncation_level - 1, ...], the second to last will be
+    indexed by [truncation_level - 2, 0, ...], and so on.
     """
     aux = []
 
@@ -160,8 +171,183 @@ def _rescale_elt(elt: fla.Elt,
         return fla.Elt(rescaled)
 
 
-def _tbba_sampling(key):
-    ...
+def _pad_to_power_two(lst):
+    """
+    pads a list at the end with 0's until it reaches length that is power of 2.
+    """
+    n = len(lst)
+    new_length = 2 ** int(jnp.ceil(jnp.log2(n)))
+    return jnp.concatenate([jnp.array(lst), jnp.zeros((new_length - n))])
+
+key = jax.random.PRNGKey(42)
+
+def _get_intermediate_massses(masses, k):
+    """
+    Helper function, computes masses of tree nodes needed for intermediate tree embedding of TBBA algo.
+
+    :param masses: array of length 2^k, representing n * a(m_j) for each child of the node j.
+    See https://www.degruyter.com/document/doi/10.1515/mcma.2002.8.4.343/html?lang=en for details.
+
+    :param k: number of intermediate steps we need. this is log_2(n), where n is the smallest power of two greater
+    than or equal to the number of points in our cubature measure.
+
+    :return: list of length k, i-th element is tuple of arrays of length 2^i, first array is masses of left nodes,
+    second array is masses of right nodes.
+    """
+    step_masses = []
+    final = []
+
+    for i in range(1, k+1):
+        new_prob_list = jax.lax.map(jnp.sum, jnp.stack(jnp.split(masses, 2 ** i)))
+        step_masses.append(new_prob_list)
+
+    for array in step_masses:
+        new = (array[::2], array[1::2])
+        final.append(new)
+
+    return final
+
+
+def _TBBA_sampling(key, cubature, num_intervals, num_particles):
+    """
+    Main sampling function, see Lyons Crisan 2009 for details.
+    https://www.degruyter.com/document/doi/10.1515/mcma.2002.8.4.343/html?lang=en
+
+    We save at each point the paths from the root node to each node we have particles in, how many particles we have
+    in each such node, and num_particles * prob_mass of each such node. We do num_particles * prob_mass for floating
+    point precision reasons, otherwise everything gets set to 0 after a relatively small number of intervals.
+
+    :param key: key for jax PRNG.
+    :param cubature: cubature formula
+    :param num_particles: number of particles we send down the tree
+    :param num_intervals: number of intervals in our partition
+
+    :return: array of shape (num_intervals, num_particles) representing indices of lie polynomials that we pick. See
+    monte carlo function for details.
+    """
+    # we pad to power of 2 for intermediate steps, which consist of constructing a binary tree between each node and its
+    # children.
+    probabilities = _pad_to_power_two(cubature[1])
+    k = jnp.log2(len(probabilities)).astype(int).item()
+    # we will scan across these arrays later, we need them to have fixed sizes.
+    xi_array = jnp.concatenate([jnp.array([num_particles]), jnp.zeros(num_particles-1)])
+    # mass does not represent a(m), as in the paper by Lyons and Crisan (LC09), but instead represents n * a(m). This
+    # is done for floating point precision; without this, most masses are set to 0 after 10-15 intervals even
+    # with degree 5, dimension 1 cubature, which has a relatively small number of elements.
+    mass_array = jnp.concatenate([jnp.array([num_particles]), jnp.zeros(num_particles-1)])
+
+    # one_full_step sends particles down from a_t(j) to a_t(j_1),  ... a_t(j_n), in the notation of LC09 (figure 2).
+
+    def one_full_step(mass, xi, path, key, k, probabilities):
+        lambdas = probabilities * mass
+        # print below is to check if we lose mass during intermediate steps. We shouldn't be losing mass here, only in
+        # the scanning phase. Left in for posterity.
+        # jax.debug.print("{}", jnp.sum(lambdas) - mass)
+
+        # intermediate_step_curr_masses are lists of masses of nodes to left and nodes to right. intermediate_step_prev_
+        # masses are the same masses, except rolled forward and stacked and ravelled such that they match their
+        # positions in the cubature measure, so n * a(j_k) is again on the k-th spot in the array.
+        intermediate_step_curr_masses = _get_intermediate_massses(lambdas, k)
+        intermediate_step_prev_masses = [jnp.expand_dims(mass, axis=0)] + [jnp.ravel(jnp.stack(x, axis=-1), order='C')
+                                                                           for x in intermediate_step_curr_masses[:-1]]
+
+        def intermediate_step(key, init_xi, init_mass, mass_1, mass_2):
+            """
+            Intermediate steps function, builds one level of the binary tree between nodes in the big tree and sends
+            particles down.
+            :param key: key for PRNG
+            :param init_xi: number of particles at current node
+            :param init_mass: mass of current node
+            :param mass_1: mass of node to the left
+            :param mass_2: mass of node to the right
+            :return:
+            """
+            frac_init_mass, integ_init_mass = jnp.modf(init_mass)
+            frac_mass_1, integ_mass_1 = jnp.modf(mass_1)
+            frac_mass_2, integ_mass_2 = jnp.modf(mass_2)
+
+            def true_fun(key, xi, i1, i2, f1, f2):
+                # case: floor(a(m)) = floor(a(m_1)) + floor(a(m_2))
+                eta = jax.random.choice(key, a=2, p=jnp.array([f2, f1]))
+                xi_1 = i1 + (xi - i1 - i2) * eta
+                xi_2 = i2 + (xi - i1 - i2) * (1 - eta)
+                return xi_1, xi_2
+
+            def false_fun(key, xi, i1, i2, f1, f2):
+                # case: floor(a(m)) = floor(a(m_1)) + floor(a(m_2)) + 1
+                eta = jax.random.choice(key, a=2, p=jnp.array([1 - f2, 1 - f1]))
+                xi_1 = i1 + 1 + (xi - i1 - i2 - 2) * eta
+                xi_2 = i2 + 1 + (xi - i1 - i2 - 2) * (1 - eta)
+                return xi_1, xi_2
+
+            partial_true = ft.partial(true_fun, xi=init_xi, i1=integ_mass_1, i2=integ_mass_2, f1=frac_mass_1,
+                                      f2=frac_mass_2)
+            partial_false = ft.partial(false_fun, xi=init_xi, i1=integ_mass_1, i2=integ_mass_2, f1=frac_mass_1,
+                                       f2=frac_mass_2)
+
+            return jax.lax.cond(integ_init_mass == integ_mass_1 + integ_mass_2, partial_true, partial_false, key)
+
+        vmapped_intermediate_step = jax.vmap(intermediate_step, in_axes=(None, 0, 0, 0, 0))
+
+        ans = jnp.expand_dims(xi, axis=0)
+        for i in range(k):
+            # get through all levels of the intermediate binary tree. Lax.scan could maybe also work here?
+            arg1, arg2 = intermediate_step_prev_masses[i], intermediate_step_curr_masses[i]
+            new = vmapped_intermediate_step(key, ans, arg1, *arg2)
+            new = jnp.ravel(jnp.stack(new, axis=-1), order='C')
+            ans = new
+
+        # append the correct index for each node to which a point could have gotten sent to, i.e. each child of our
+        # current node. Our previous stacking/ravelling ensures these are in the correct order.
+        new_paths = jnp.stack([path] * 2**k, axis=0)
+        new_paths = jnp.concatenate([new_paths, jnp.expand_dims(jnp.arange(2**k), axis=-1)], axis=-1)
+        return ans, lambdas, new_paths
+
+    partial_full_step = ft.partial(one_full_step, k=k, probabilities=probabilities)
+    vmapped_full_step = jax.vmap(partial_full_step, in_axes=(0, 0, 0, 0))
+
+
+    def body_fun(carry, x, full_step_func, num_particles):
+        within_step_key_array = jax.random.split(x, num_particles)
+        xis, masses, paths = carry
+        # jax.debug.print('xi array {}', xis)
+        # jax.debug.print('mass array {}', masses)
+        # jax.debug.print('paths array {}', paths)
+        # paths is array of shape (num_particles, len_paths)
+        new_xis, new_masses, new_paths = full_step_func(masses, xis, paths, within_step_key_array)
+        new_xis, new_masses = jnp.expand_dims(new_xis, axis=-1), jnp.expand_dims(new_masses, axis=-1)
+
+        stacked = jnp.concatenate([new_xis, new_masses, new_paths], axis=-1)
+        stacked = stacked.reshape(-1, stacked.shape[-1])
+        stacked = jnp.concatenate([stacked, jnp.expand_dims(jnp.zeros(stacked.shape[-1]), axis=0)], axis=0)
+        # below we save the index of each position where we have >0 particles. We only save those
+        # paths/num_particles/masses.
+        idx = jnp.where(stacked[..., 0] > 0, size=num_particles, fill_value=-1)
+
+        new_stacked = stacked[idx[0], ...]
+        new_xis = jnp.squeeze(new_stacked[..., 0])
+        new_masses = jnp.squeeze(new_stacked[..., 1])
+        new_paths = new_stacked[..., 3:]
+
+        carry = (new_xis, new_masses, new_paths)
+
+        return carry, jnp.array([0.])
+
+    # we split the initial key once on the outside of the scan to get a separate key for each interval, and once inside
+    # the scan to get a separate key for each particle.
+    outside_step_key_array = jax.random.split(key, num_intervals)
+    # pad the paths as jax needs fixed size arrays.
+    init_paths = jnp.pad(jnp.expand_dims((-1) * jnp.ones(num_particles), axis=-1), pad_width = ((0, 0), (num_intervals, 0)))
+    init = (xi_array, mass_array, init_paths)
+    partial_body = ft.partial(body_fun, full_step_func=vmapped_full_step, num_particles=num_particles)
+
+    final_values, _ = jax.lax.scan(partial_body, init, xs=outside_step_key_array, length=num_intervals)
+
+    paths = final_values[-1]
+    paths = paths[..., 1:]
+    xis = final_values[0]
+    paths = jnp.repeat(paths, xis.astype(int), axis=0)
+    return jnp.swapaxes(paths, axis1=0, axis2=1).astype(int)
 
 
 def _monte_carlo_sampling(key: jax.typing.ArrayLike,
@@ -245,12 +431,13 @@ def _get_sampled_polys(sampled_points: jax.typing.ArrayLike,
     return pick_all(sampled_points, rescaled_polys)
 
 
-def make_data_monte_carlo(key: jax.typing.ArrayLike,
+def make_data(key: jax.typing.ArrayLike,
                           cubature: tuple[list[fla.Elt], list[float]],
                           partition: list[float],
                           num_particles: int,
                           contr_dim: int,
                           truncation_level: int,
+                          sampling_method: str,
                           signature_flag: Optional[bool] = False) -> jax.typing.ArrayLike:
     """
     Generate the data via Monte Carlo sampling through the CDE tree. Gets sampled points, picks polys according to
@@ -268,7 +455,10 @@ def make_data_monte_carlo(key: jax.typing.ArrayLike,
 
     dim = contr_dim + 1
     num_intervals = len(partition) - 1
-    sampled_points = _monte_carlo_sampling(key, cubature, num_intervals, num_particles)
+    if sampling_method == 'Monte Carlo':
+        sampled_points = _monte_carlo_sampling(key, cubature, num_intervals, num_particles)
+    elif sampling_method == 'TBBA':
+        sampled_points = _TBBA_sampling(key, cubature, num_intervals, num_particles)
     rescaled_polys = _get_rescaled_polys(cubature, partition, truncation_level, dim, signature_flag)
     sampled_polys = _get_sampled_polys(sampled_points, rescaled_polys)
 
@@ -366,6 +556,9 @@ def log_ode_method_sampling(combined_vf: callable,
     solutions evaluated at the final time, as well as the time it took to perform the approximations.
     """
 
+    vf_sig = isp.signature(combined_vf)
+    time_dep_flag = 't' in vf_sig.parameters.keys()
+
     num_particles = sampled_lie_polys.shape[1]
     initial_vector = jnp.stack([initial_condition] * num_particles, axis=0)
     derivatives = get_vf_derivatives(combined_vf, truncation_level)
@@ -460,7 +653,7 @@ def log_ode_method_full_tree(combined_vf: callable,
     """
 
     dim = combined_vf(initial_condition).shape[1]
-    data = _get_rescaled_polys(cubature, partition, truncation_level, dim, signature_flag=True)
+    data = _get_rescaled_polys(cubature, partition, truncation_level, dim, signature_flag=False)
     num_intervals = len(partition) - 1
     m = len(cubature[0])
     nr_functions = len(payoffs)
@@ -720,7 +913,6 @@ def taylor_increment_full_tree(combined_vf: callable,
 
     dim = combined_vf(initial_condition).shape[1]
     data = _get_rescaled_polys(cubature, partition, truncation_level, dim, signature_flag=True)
-
     num_intervals = len(partition) - 1
     m = len(cubature[0])
     nr_functions = len(payoffs)
@@ -860,9 +1052,9 @@ def taylor_increment_full_tree(combined_vf: callable,
 
 if __name__ == '__main__':
 
-    nr_intervals = 3
+    nr_intervals = 100
     gamma = 1
-    nr_steps = 10
+    nr_steps = 100
     level = 3
 
     seed = 1890
@@ -903,7 +1095,7 @@ if __name__ == '__main__':
 
     partition = get_partition((0., 0.164), nr_intervals, gamma)
 
-    data = make_data_monte_carlo(key, cubature, partition, nr_steps, contr_dim, level, False)
+    data = make_data(key, cubature, partition, nr_steps, contr_dim, level, 'TBBA', False)
     print('DONE, time elapsed: ', dt.datetime.now() - time_0)
 
     ode_solver_2 = diffrax.Dopri5()
@@ -911,7 +1103,7 @@ if __name__ == '__main__':
     ssc_1 = diffrax.ConstantStepSize()
     ssc_2 = diffrax.PIDController(rtol=1e-3, atol=1e-3)
 
-    ans_3 = taylor_increment_full_tree(comb, jnp.array([150., 0.1]), cubature, partition, 3, 0, [lambda x: x[-1] + x[-2], lambda x: 2 * x[-1] + 2 * x[-2]], dense=True)
+    ans_3 = log_ode_method_sampling(comb, jnp.array([150., 0.1]), cubature, partition, ssc_2, dense=True)
 
     print(ans_3)
 
